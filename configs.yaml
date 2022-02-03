@@ -20,7 +20,7 @@ defaults:
   task: 'dmc_walker_walk'
   size: [64, 64]
   envs: 1
-  action_repeat: 2
+  action_repeat: 1
   time_limit: 1000
   grayscale: False
   prefill: 2500
@@ -63,8 +63,8 @@ defaults:
   weight_decay: 0.0
 
   # Training
-  batch_size: 50
-  batch_length: 50
+  batch_size: 64
+  batch_length: 40
   train_every: 5
   train_steps: 1
   pretrain: 100
@@ -86,7 +86,7 @@ defaults:
   # Behavior.
   discount: 0.99
   discount_lambda: 0.95
-  imag_horizon: 15
+  imag_horizon: 10
   imag_gradient: 'dynamics'
   imag_gradient_mix: '0.1'
   imag_sample: True
@@ -229,17 +229,18 @@ atari:
 dmc:
 
   # General
-  task: 'dmc_walker_walk'
+  task: 'modular_cheetah_2_front'
+  # task: 'dmc_walker_walk'
   steps: 1e7
-  eval_every: 1e4
-  log_every: 1e4
+  eval_every: 1e3
+  log_every: 1e2
   prefill: 2500
   dataset_size: 0
   pretrain: 100
 
   # Environment
-  time_limit: 1000
-  action_repeat: 2
+  time_limit: 200
+  action_repeat: 1
   train_every: 5
   train_steps: 1
 
@@ -283,3 +284,6 @@ debug:
   batch_size: 10
   batch_length: 20
 
+modular:
+  cnn_actor_depth: 4
+  fc_layer_depth: 3

@@ -32,7 +32,6 @@ class RSSM(nn.Module):
     self._temp_post = temp_post
     self._embed = embed
     self._device = device
-
     inp_layers = []
     if self._discrete:
       inp_dim = self._stoch * self._discrete + num_actions
@@ -235,6 +234,67 @@ class RSSM(nn.Module):
     loss *= scale
     return loss, value
 
+class ConvActor(nn.Module):
+  def __init__(self, config, grayscale=False,
+               depth=32, act=nn.ReLU, kernels=(4, 4, 4, 4), 
+               fc_layer_num=3, units=400):
+    super(ConvActor, self).__init__()
+    if config.size[0] == 64 and config.size[1] == 64:
+      embed_size = 2 ** (len(config.encoder_kernels)-1) * config.cnn_actor_depth
+      embed_size *= 2 * 2
+    else:
+      raise NotImplemented(f"{config.size} is not applicable now")
+    self.embed_size = embed_size
+    print("cnn actor embed: ", embed_size)
+    self._act = act
+    self._cnn_depth = depth
+    self._kernels = kernels
+    self._fc_layer_num = fc_layer_num
+    self._units = units
+    self._size = config.num_actions
+    cnn_layers = []
+    for i, kernel in enumerate(self._kernels):
+      if i == 0:
+        if grayscale:
+          inp_dim = 1
+        else:
+          inp_dim = 3
+      else:
+        inp_dim = 2 ** (i-1) * self._cnn_depth
+      depth = 2 ** i * self._cnn_depth
+      cnn_layers.append(nn.Conv2d(inp_dim, depth, kernel, 2))
+      cnn_layers.append(act())
+    self.cnn_layers = nn.Sequential(*cnn_layers)
+
+    fc_layers = []
+    inp_dim = embed_size
+    for index in range(self._fc_layer_num):
+      fc_layers.append(nn.Linear(inp_dim, self._units))
+      fc_layers.append(act())
+      if index == 0:
+        inp_dim = self._units
+    self.fc_layers = nn.Sequential(*fc_layers)
+
+
+    self._dist_layer = nn.Linear(self._units, 2 * self._size)
+    
+  def __call__(self, feat, decoder):
+    with torch.no_grad():
+      img = decoder(feat).mode().detach()
+    x = img.reshape((-1,) + tuple(img.shape[-3:]))
+    x = x.permute(0, 3, 1, 2)
+    x = self.cnn_layers(x)
+    x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
+    shape = list(img.shape[:-3]) + [x.shape[-1]]
+    x = x.reshape(shape)
+
+    x = self.fc_layers(x)
+    x = self._dist_layer(x)
+    mean, std = torch.split(x, 2, -1)
+    std = F.softplus(std + self._init_std) + self._min_std
+    dist = torchd.normal.Normal(mean, std)
+    dist = tools.ContDist(torchd.independent.Independent(dist, 1))
+    return x
 
 class ConvEncoder(nn.Module):
 
@@ -397,6 +457,7 @@ class ActionHead(nn.Module):
       self._dist_layer = nn.Linear(self._units, self._size)
 
   def __call__(self, features, dtype=None):
+    
     x = features
     x = self._pre_layers(x)
     if self._dist == 'tanh_normal':
@@ -427,7 +488,7 @@ class ActionHead(nn.Module):
       dist = tools.ContDist(torchd.independent.Independent(dist, 1))
     elif self._dist == 'normal_1':
       x = self._dist_layer(x)
-      dist = torchd.normal.Normal(mean, 1)
+      dist = torchd.normal.Normal(x, 1)
       dist = tools.ContDist(torchd.independent.Independent(dist, 1))
     elif self._dist == 'trunc_normal':
       x = self._dist_layer(x)

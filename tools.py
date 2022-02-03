@@ -187,7 +187,7 @@ def from_generator(generator, batch_size):
     yield data
 
 
-def sample_episodes(episodes, length=None, balance=False, seed=0):
+def sample_episodes(episodes, length=None, balance=False, seed=0, mode = None):
   random = np.random.RandomState(seed)
   while True:
     episode = random.choice(list(episodes.values()))

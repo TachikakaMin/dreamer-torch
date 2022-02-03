@@ -1,9 +1,12 @@
 import threading
-
+from stable_baselines3.common.vec_env.subproc_vec_env import SubprocVecEnv
 import gym
 import numpy as np
-
-
+import os
+import utils
+import argparse
+import cv2
+from config import *
 class DeepMindLabyrinth(object):
 
   ACTION_SET_DEFAULT = (
@@ -163,6 +166,83 @@ class DeepMindControl:
     return self._env.physics.render(*self._size, camera_id=self._camera)
 
 
+class ModularControl:
+  def __init__(self, morphologies, mode,  action_repeat=1, size=(64, 64), camera=None):
+    domain, _ = morphologies.split('_', 1)
+    self._action_repeat = action_repeat
+    self._size = size
+    if camera is None:
+      camera = dict(quadruped=2).get(domain, 0)
+    self._camera = camera
+
+    envs_train_names = []
+    args = argparse.Namespace()
+    args.morphologies = [morphologies]
+    args.graphs = dict()
+    
+    # existing envs
+    for morphology in args.morphologies:
+      envs_train_names += [name[:-4] for name in os.listdir(XML_DIR) if '.xml' in name and morphology in name]
+    for name in envs_train_names:
+      args.graphs[name] = utils.getGraphStructure(os.path.join(XML_DIR, '{}.xml'.format(name)))
+    envs_train_names.sort()
+    args.envs_train_names = envs_train_names
+    args.num_envs_train = len(envs_train_names)
+    print("#" * 50 + '\ntraining envs: {}\n'.format(envs_train_names) + "#" * 50)
+
+    # Set up training env and policy ================================================
+    args.limb_obs_size, args.max_action, envs_train = utils.registerEnvs(args, envs_train_names, mode)
+    args.max_num_limbs = max([len(args.graphs[env_name]) for env_name in envs_train_names])
+    # create vectorized training env
+    args.obs_max_len = args.max_num_limbs * args.limb_obs_size
+    self._env = SubprocVecEnv(envs_train)  # vectorized env
+    # determine the maximum number of children in all the training envs
+    args.max_children = utils.findMaxChildren(envs_train_names, args.graphs)
+    self.args = args
+
+  @property
+  def observation_space(self):
+    spaces = {}
+    for key, value in self._env.observation_spec().items():
+      spaces[key] = gym.spaces.Box(
+          -np.inf, np.inf, value.shape, dtype=np.float32)
+    spaces['image'] = gym.spaces.Box(
+        0, 255, self._size + (3,), dtype=np.uint8)
+    return gym.spaces.Dict(spaces)
+
+  @property
+  def action_space(self):
+    spec = self._env.action_space
+    return gym.spaces.Box(spec.low[0], spec.high[0], (self.args.max_num_limbs,),dtype=np.float32)
+
+  def step(self, action):
+    action = [action]
+    assert np.isfinite(action).all(), action
+    reward = 0
+    for _ in range(self._action_repeat):
+      obs, r, done, info = self._env.step(action)
+      obs, r, done, info = obs[0], r[0], done[0], info[0]
+      reward += r
+      if done: break
+    obs = {"obs_list" : obs}
+    obs['image'] = self.render()[0]
+    info = dict(info)
+    return obs, reward, done, info
+
+  def reset(self):
+    obs_list = self._env.reset()
+    obs = {'obs_list': obs_list[0]}
+    obs['image'] = self.render()[0]
+    return obs
+
+  def render(self, *args, **kwargs):
+    if kwargs.get('mode', 'rgb_array') != 'rgb_array':
+      raise ValueError("Only render mode 'rgb_array' is supported.")
+    env_img_list = self._env.get_images()
+    new_img_list = [cv2.resize(img, self._size) for img in env_img_list]
+    return new_img_list
+
+
 class Atari:
 
   LOCK = threading.Lock()
@@ -224,8 +304,9 @@ class Atari:
 
 class CollectDataset:
 
-  def __init__(self, env, callbacks=None, precision=32):
+  def __init__(self, env, callbacks=None, precision=32, mode = None):
     self._env = env
+    self._mode = mode
     self._callbacks = callbacks or ()
     self._precision = precision
     self._episode = None
@@ -275,7 +356,7 @@ class CollectDataset:
     elif np.issubdtype(value.dtype, np.uint8):
       dtype = np.uint8
     else:
-      raise NotImplementedError(value.dtype)
+      dtype = np.float32
     return value.astype(dtype)
 
 

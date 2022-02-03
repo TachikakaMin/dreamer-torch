@@ -141,6 +141,7 @@ class Dreamer(nn.Module):
       context = {k: v[:, :-1] for k, v in context.items()}
     reward = lambda f, s, a: self._wm.heads['reward'](
         self._wm.dynamics.get_feat(s)).mode()
+
     metrics.update(self._task_behavior._train(start, reward)[-1])
     if self._config.expl_behavior != 'greedy':
       if self._config.pred_discount:
@@ -158,9 +159,9 @@ def count_steps(folder):
   return sum(int(str(n).split('-')[-1][:-4]) - 1 for n in folder.glob('*.npz'))
 
 
-def make_dataset(episodes, config):
+def make_dataset(episodes, config, mode):
   generator = tools.sample_episodes(
-      episodes, config.batch_length, config.oversample_ends)
+      episodes, config.batch_length, config.oversample_ends, mode=mode)
   dataset = tools.from_generator(generator, config.batch_size)
   return dataset
 
@@ -184,6 +185,9 @@ def make_env(config, logger, mode, train_eps, eval_eps):
         mode if 'train' in mode else 'test',
         config.action_repeat)
     env = wrappers.OneHotAction(env)
+  elif suite == 'modular':
+    env = wrappers.ModularControl(task, mode, config.action_repeat, config.size)
+    env = wrappers.NormalizeActions(env)
   else:
     raise NotImplementedError(suite)
   env = wrappers.TimeLimit(env, config.time_limit)
@@ -191,7 +195,7 @@ def make_env(config, logger, mode, train_eps, eval_eps):
   if (mode == 'train') or (mode == 'eval'):
     callbacks = [functools.partial(
         process_episode, config, logger, mode, train_eps, eval_eps)]
-    env = wrappers.CollectDataset(env, callbacks)
+    env = wrappers.CollectDataset(env, callbacks, mode = mode)
   env = wrappers.RewardObs(env)
   return env
 
@@ -256,10 +260,10 @@ def main(config):
   eval_envs = [make('eval') for _ in range(config.envs)]
   acts = train_envs[0].action_space
   config.num_actions = acts.n if hasattr(acts, 'n') else acts.shape[0]
-
   if not config.offline_traindir:
     prefill = max(0, config.prefill - count_steps(config.traindir))
     print(f'Prefill dataset ({prefill} steps).')
+    
     if hasattr(acts, 'discrete'):
       random_actor = tools.OneHotDist(torch.zeros_like(torch.Tensor(acts.low))[None])
     else:
@@ -275,8 +279,8 @@ def main(config):
     logger.step = config.action_repeat * count_steps(config.traindir)
 
   print('Simulate agent.')
-  train_dataset = make_dataset(train_eps, config)
-  eval_dataset = make_dataset(eval_eps, config)
+  train_dataset = make_dataset(train_eps, config, mode='train')
+  eval_dataset = make_dataset(eval_eps, config, mode='eval')
   agent = Dreamer(config, logger, train_dataset).to(config.device)
   agent.requires_grad_(requires_grad=False)
   if (logdir / 'latest_model.pt').exists():
