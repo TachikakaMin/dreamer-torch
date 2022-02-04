@@ -388,7 +388,7 @@ class TanhBijector(torchd.Transform):
 
   def _forward_log_det_jacobian(self, x):
     log2 = torch.math.log(2.0)
-    return 2.0 * (log2 - x - torch.softplus(-2.0 * x))
+    return 2.0 * (log2 - x - F.softplus(-2.0 * x))
 
 
 def static_scan_for_lambda_return(fn, inputs, start):

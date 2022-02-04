@@ -234,10 +234,12 @@ class RSSM(nn.Module):
     loss *= scale
     return loss, value
 
+# decode feat ---> img, use img train actor
 class ConvActor(nn.Module):
   def __init__(self, config, grayscale=False,
                depth=32, act=nn.ReLU, kernels=(4, 4, 4, 4), 
-               fc_layer_num=3, units=400):
+               fc_layer_num=3, init_std=0.0, min_std=0.1, 
+               units=400):
     super(ConvActor, self).__init__()
     if config.size[0] == 64 and config.size[1] == 64:
       embed_size = 2 ** (len(config.encoder_kernels)-1) * config.cnn_actor_depth
@@ -252,6 +254,10 @@ class ConvActor(nn.Module):
     self._fc_layer_num = fc_layer_num
     self._units = units
     self._size = config.num_actions
+    self._min_std = min_std
+    self._init_std = init_std
+
+
     cnn_layers = []
     for i, kernel in enumerate(self._kernels):
       if i == 0:
@@ -279,8 +285,7 @@ class ConvActor(nn.Module):
     self._dist_layer = nn.Linear(self._units, 2 * self._size)
     
   def __call__(self, feat, decoder):
-    with torch.no_grad():
-      img = decoder(feat).mode().detach()
+    img = decoder(feat).mode()
     x = img.reshape((-1,) + tuple(img.shape[-3:]))
     x = x.permute(0, 3, 1, 2)
     x = self.cnn_layers(x)
@@ -290,11 +295,14 @@ class ConvActor(nn.Module):
 
     x = self.fc_layers(x)
     x = self._dist_layer(x)
+    if (x.shape[0] == 1):
+      x = x.squeeze(0)
     mean, std = torch.split(x, 2, -1)
     std = F.softplus(std + self._init_std) + self._min_std
     dist = torchd.normal.Normal(mean, std)
     dist = tools.ContDist(torchd.independent.Independent(dist, 1))
-    return x
+    return dist
+
 
 class ConvEncoder(nn.Module):
 
@@ -364,6 +372,8 @@ class ConvDecoder(nn.Module):
     self._cnnt_layers = nn.Sequential(*cnnt_layers)
 
   def __call__(self, features, dtype=None):
+    if len(features.shape) == 2:
+      features = features[None, : ,:]
     if self._thin:
       x = self._linear_layer(features)
       x = x.reshape([-1, 1, 1, 32 * self._depth])
@@ -394,6 +404,9 @@ class DenseHead(nn.Module):
     self._dist = dist
     self._std = std
 
+    if self._std == 'learned':
+      self._std_layer = nn.Linear(inp_dim, np.prod(self._shape))
+
     mean_layers = []
     for index in range(self._layers):
       mean_layers.append(nn.Linear(inp_dim, self._units))
@@ -403,15 +416,12 @@ class DenseHead(nn.Module):
     mean_layers.append(nn.Linear(inp_dim, np.prod(self._shape)))
     self._mean_layers = nn.Sequential(*mean_layers)
 
-    if self._std == 'learned':
-      self._std_layer = nn.Linear(self._units, np.prod(self._shape))
-
   def __call__(self, features, dtype=None):
     x = features
     mean = self._mean_layers(x)
     if self._std == 'learned':
       std = self._std_layer(x)
-      std = torch.softplus(std) + 0.01
+      std = F.softplus(std) + 0.01
     else:
       std = self._std
     if self._dist == 'normal':
@@ -424,6 +434,35 @@ class DenseHead(nn.Module):
       return tools.Bernoulli(torchd.independent.Independent(
         torchd.bernoulli.Bernoulli(logits=mean), len(self._shape)))
     raise NotImplementedError(self._dist)
+
+# use obs train actor
+class ObsDenseHead(nn.Module):
+
+  def __init__(
+      self, inp_dim,
+      shape, layers, units, act=nn.ELU, dist='normal', std=1.0):
+    super(ObsDenseHead, self).__init__()
+    self._shape = (shape,) if isinstance(shape, int) else shape
+    if len(self._shape) == 0:
+      self._shape = (1,)
+    self._layers = layers
+    self._units = units
+    self._act = act
+    self._dist = dist
+    self._std = std
+    mean_layers = []
+    for index in range(self._layers):
+      mean_layers.append(nn.Linear(inp_dim, self._units))
+      mean_layers.append(act())
+      if index == 0:
+        inp_dim = self._units
+    mean_layers.append(nn.Linear(inp_dim, np.prod(self._shape)))
+    self._mean_layers = nn.Sequential(*mean_layers)
+
+  def __call__(self, features, dtype=None):
+    x = features['obs']
+    x = self._mean_layers(x)
+    return x
 
 
 class ActionHead(nn.Module):
@@ -456,9 +495,93 @@ class ActionHead(nn.Module):
     elif self._dist in ['normal_1','onehot','onehot_gumbel']:
       self._dist_layer = nn.Linear(self._units, self._size)
 
-  def __call__(self, features, dtype=None):
+  def __call__(self, features, decoder=None, dtype=None):
     
     x = features
+    x = self._pre_layers(x)
+    if self._dist == 'tanh_normal':
+      x = self._dist_layer(x)
+      mean, std = torch.split(x, 2, -1)
+      mean = torch.tanh(mean)
+      std = F.softplus(std + self._init_std) + self._min_std
+      dist = torchd.normal.Normal(mean, std)
+      dist = torchd.transformed_distribution.TransformedDistribution(
+          dist, tools.TanhBijector())
+      dist = torchd.independent.Independent(dist, 1)
+      dist = tools.SampleDist(dist)
+    elif self._dist == 'tanh_normal_5':
+      x = self._dist_layer(x)
+      mean, std = torch.split(x, 2, -1)
+      mean = 5 * torch.tanh(mean / 5)
+      std = F.softplus(std + 5) + 5
+      dist = torchd.normal.Normal(mean, std)
+      dist = torchd.transformed_distribution.TransformedDistribution(
+          dist, tools.TanhBijector())
+      dist = torchd.independent.Independent(dist, 1)
+      dist = tools.SampleDist(dist)
+    elif self._dist == 'normal':
+      x = self._dist_layer(x)
+      mean, std = torch.split(x, 2, -1)
+      std = F.softplus(std + self._init_std) + self._min_std
+      dist = torchd.normal.Normal(mean, std)
+      dist = tools.ContDist(torchd.independent.Independent(dist, 1))
+    elif self._dist == 'normal_1':
+      x = self._dist_layer(x)
+      dist = torchd.normal.Normal(x, 1)
+      dist = tools.ContDist(torchd.independent.Independent(dist, 1))
+    elif self._dist == 'trunc_normal':
+      x = self._dist_layer(x)
+      mean, std = torch.split(x, [self._size]*2, -1)
+      mean = torch.tanh(mean)
+      std = 2 * torch.sigmoid(std / 2) + self._min_std
+      dist = tools.SafeTruncatedNormal(mean, std, -1, 1)
+      dist = tools.ContDist(torchd.independent.Independent(dist, 1))
+    elif self._dist == 'onehot':
+      x = self._dist_layer(x)
+      dist = tools.OneHotDist(x)
+    elif self._dist == 'onehot_gumble':
+      x = self._dist_layer(x)
+      temp = self._temp
+      dist = tools.ContDist(torchd.gumbel.Gumbel(x, 1/temp))
+    else:
+      raise NotImplementedError(self._dist)
+    return dist
+
+# decode feat --> obs, train actor
+class ObsActor(nn.Module):
+
+  def __init__(
+      self, inp_dim, size, layers, units, act=nn.ELU, dist='trunc_normal',
+      init_std=0.0, min_std=0.1, action_disc=5, temp=0.1, outscale=0):
+    super(ObsActor, self).__init__()
+    self._size = size
+    self._layers = layers
+    self._units = units
+    self._dist = dist
+    self._act = act
+    self._min_std = min_std
+    self._init_std = init_std
+    self._action_disc = action_disc
+    self._temp = temp() if callable(temp) else temp
+    self._outscale = outscale
+
+    pre_layers = []
+    for index in range(self._layers):
+      pre_layers.append(nn.Linear(inp_dim, self._units))
+      pre_layers.append(act())
+      if index == 0:
+        inp_dim = self._units
+    self._pre_layers = nn.Sequential(*pre_layers)
+
+    if self._dist in ['tanh_normal','tanh_normal_5','normal','trunc_normal']:
+      self._dist_layer = nn.Linear(self._units, 2 * self._size)
+    elif self._dist in ['normal_1','onehot','onehot_gumbel']:
+      self._dist_layer = nn.Linear(self._units, self._size)
+
+  def __call__(self, features, decoder=None, dtype=None):
+
+    x = decoder(features).mean
+
     x = self._pre_layers(x)
     if self._dist == 'tanh_normal':
       x = self._dist_layer(x)

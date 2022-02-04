@@ -195,6 +195,7 @@ class ModularControl:
     args.max_num_limbs = max([len(args.graphs[env_name]) for env_name in envs_train_names])
     # create vectorized training env
     args.obs_max_len = args.max_num_limbs * args.limb_obs_size
+    print("obs_max_len: ", args.obs_max_len)
     self._env = SubprocVecEnv(envs_train)  # vectorized env
     # determine the maximum number of children in all the training envs
     args.max_children = utils.findMaxChildren(envs_train_names, args.graphs)
@@ -224,14 +225,14 @@ class ModularControl:
       obs, r, done, info = obs[0], r[0], done[0], info[0]
       reward += r
       if done: break
-    obs = {"obs_list" : obs}
+    obs = {"obs" : obs}
     obs['image'] = self.render()[0]
     info = dict(info)
     return obs, reward, done, info
 
   def reset(self):
     obs_list = self._env.reset()
-    obs = {'obs_list': obs_list[0]}
+    obs = {'obs': obs_list[0]}
     obs['image'] = self.render()[0]
     return obs
 

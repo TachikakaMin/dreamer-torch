@@ -91,7 +91,7 @@ class Dreamer(nn.Module):
   def _policy(self, obs, state, training):
     if state is None:
       batch_size = len(obs['image'])
-      latent = self._wm.dynamics.initial(len(obs['image']))
+      latent = self._wm.dynamics.initial(batch_size)
       action = torch.zeros((batch_size, self._config.num_actions)).to(self._config.device)
     else:
       latent, action = state
@@ -102,19 +102,19 @@ class Dreamer(nn.Module):
       latent['stoch'] = latent['mean']
     feat = self._wm.dynamics.get_feat(latent)
     if not training:
-      actor = self._task_behavior.actor(feat)
+      actor = self._task_behavior.actor(feat, self._wm.heads['image'])
       action = actor.mode()
     elif self._should_expl(self._step):
-      actor = self._expl_behavior.actor(feat)
+      actor = self._expl_behavior.actor(feat, self._wm.heads['image'])
       action = actor.sample()
     else:
-      actor = self._task_behavior.actor(feat)
+      actor = self._task_behavior.actor(feat, self._wm.heads['image'])
       action = actor.sample()
     logprob = actor.log_prob(action)
     latent = {k: v.detach()  for k, v in latent.items()}
     action = action.detach()
     if self._config.actor_dist == 'onehot_gumble':
-      action = torch.one_hot(torch.argmax(aciton, dim=-1), self._config.num_actions)
+      action = torch.one_hot(torch.argmax(action, dim=-1), self._config.num_actions)
     action = self._exploration(action, training)
     policy_output = {'action': action, 'logprob': logprob}
     state = (latent, action)
@@ -142,7 +142,7 @@ class Dreamer(nn.Module):
     reward = lambda f, s, a: self._wm.heads['reward'](
         self._wm.dynamics.get_feat(s)).mode()
 
-    metrics.update(self._task_behavior._train(start, reward)[-1])
+    metrics.update(self._task_behavior._train(start, reward, decoder = self._wm.heads['image'])[-1])
     if self._config.expl_behavior != 'greedy':
       if self._config.pred_discount:
         data = {k: v[:, :-1] for k, v in data.items()}

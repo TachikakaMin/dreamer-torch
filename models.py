@@ -15,14 +15,20 @@ class WorldModel(nn.Module):
     self._step = step
     self._use_amp = True if config.precision==16 else False
     self._config = config
-    self.encoder = networks.ConvEncoder(config.grayscale,
-        config.cnn_depth, config.act, config.encoder_kernels)
+    # self.encoder = networks.ConvEncoder(config.grayscale,
+    #     config.cnn_depth, config.act, config.encoder_kernels)
 
     if config.size[0] == 64 and config.size[1] == 64:
       embed_size = 2 ** (len(config.encoder_kernels)-1) * config.cnn_depth
       embed_size *= 2 * 2
     else:
       raise NotImplemented(f"{config.size} is not applicable now")
+    
+    self.encoder = networks.ObsDenseHead(
+        config.obs_max_len,  # pytorch version
+        embed_size, config.obs_encoder_layers, config.units, config.act, std="leaned")
+
+
     self.dynamics = networks.RSSM(
         config.dyn_stoch, config.dyn_deter, config.dyn_hidden,
         config.dyn_input_layers, config.dyn_output_layers,
@@ -41,6 +47,11 @@ class WorldModel(nn.Module):
         feat_size,  # pytorch version
         config.cnn_depth, config.act, shape, config.decoder_kernels,
         config.decoder_thin)
+
+    # self.heads['obs'] = networks.DenseHead(
+    #     feat_size,  # pytorch version
+    #     config.obs_max_len, config.obs_decode_layers, config.units, config.act, std='learned')
+
     self.heads['reward'] = networks.DenseHead(
         feat_size,  # pytorch version
         [], config.reward_layers, config.units, config.act)
@@ -150,9 +161,17 @@ class ImagBehavior(nn.Module):
         config.actor_dist, config.actor_init_std, config.actor_min_std,
         config.actor_dist, config.actor_temp, config.actor_outscale)
     
-    self.img_actor = networks.ConvActor(config, config.grayscale,
-        config.cnn_actor_depth, config.act, config.encoder_kernels, config.fc_layer_depth)
+    # self.actor = networks.ConvActor(config, config.grayscale,
+    #     config.cnn_actor_depth, config.act, 
+    #     config.encoder_kernels, config.fc_layer_depth,
+    #     config.actor_init_std, config.actor_min_std)
     
+    # self.actor = networks.ObsActor(
+    #     config.obs_max_len,
+    #     config.num_actions, config.obs_actor_layers, config.units, config.act,
+    #     config.actor_dist, config.actor_init_std, config.actor_min_std,
+    #     config.actor_dist, config.actor_temp, config.actor_outscale
+    # )
 
     self.value = networks.DenseHead(
         feat_size,  # pytorch version
@@ -172,7 +191,7 @@ class ImagBehavior(nn.Module):
         **kw)
 
   def _train(
-      self, start, objective=None, action=None, reward=None, imagine=None, tape=None, repeats=None):
+      self, start, objective=None, action=None, reward=None, imagine=None, tape=None, repeats=None, decoder=None):
     objective = objective or self._reward
     self._update_slow_target()
     metrics = {}
@@ -180,11 +199,10 @@ class ImagBehavior(nn.Module):
     with tools.RequiresGrad(self.actor):
       with torch.cuda.amp.autocast(self._use_amp):
         imag_feat, imag_state, imag_action = self._imagine(
-            start, self.actor, self._config.imag_horizon, repeats)  # (15, 2560, 200)
+            start, self.actor, self._config.imag_horizon, repeats, decoder=decoder)  # (15, 2560, 200)
             
         reward = objective(imag_feat, imag_state, imag_action)
-        actor_ent = self.actor(imag_feat).entropy()
-        # actor_ent = self.img_actor(imag_feat, ).entropy()
+        actor_ent = self.actor(imag_feat, decoder).entropy()
         state_ent = self._world_model.dynamics.get_dist(
             imag_state).entropy()
         target, weights = self._compute_target(
@@ -192,7 +210,7 @@ class ImagBehavior(nn.Module):
             self._config.slow_actor_target)
         actor_loss, mets = self._compute_actor_loss(
             imag_feat, imag_state, imag_action, target, actor_ent, state_ent,
-            weights)
+            weights, decoder)
         metrics.update(mets)
         if self._config.slow_value_target != self._config.slow_actor_target:
           target, weights = self._compute_target(
@@ -217,7 +235,7 @@ class ImagBehavior(nn.Module):
       metrics.update(self._value_opt(value_loss, self.value.parameters()))
     return imag_feat, imag_state, imag_action, weights, metrics
 
-  def _imagine(self, start, policy, horizon, repeats=None):
+  def _imagine(self, start, policy, horizon, repeats=None, decoder=None):
     dynamics = self._world_model.dynamics
     if repeats:
       raise NotImplemented("repeats is not implemented in this version")
@@ -228,12 +246,12 @@ class ImagBehavior(nn.Module):
       state, _, _ = prev
       feat = dynamics.get_feat(state) # stoch+deter
       inp = feat.detach() if self._stop_grad_actor else feat
-      action = policy(inp).sample()
+      action = policy(inp, decoder).sample()
       succ = dynamics.img_step(state, action, sample=self._config.imag_sample)
       return succ, feat, action
 
     feat = 0 * dynamics.get_feat(start) # stoch+deter
-    action = policy(feat).mode()
+    action = policy(feat, decoder).mode()
     succ, feats, actions = tools.static_scan(
         step, [torch.arange(horizon)], (start, feat, action))
     states = {k: torch.cat([
@@ -268,10 +286,10 @@ class ImagBehavior(nn.Module):
 
   def _compute_actor_loss(
       self, imag_feat, imag_state, imag_action, target, actor_ent, state_ent,
-      weights):
+      weights, decoder):
     metrics = {}
     inp = imag_feat.detach() if self._stop_grad_actor else imag_feat
-    policy = self.actor(inp)
+    policy = self.actor(inp, decoder)
     actor_ent = policy.entropy()
     target = torch.stack(target, dim=1)
     if self._config.imag_gradient == 'dynamics':
