@@ -6,6 +6,8 @@ import pathlib
 import sys
 import warnings
 
+from scipy.fftpack import shift
+
 os.environ['MUJOCO_GL'] = 'egl'
 
 import numpy as np
@@ -19,7 +21,7 @@ import tools
 import wrappers
 
 import torch
-from torch import nn
+from torch import nn, unsqueeze
 from torch import distributions as torchd
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -56,7 +58,21 @@ class Dreamer(nn.Module):
         plan2explore=lambda: expl.Plan2Explore(config, self._wm, reward),
     )[config.expl_behavior]()
 
-  def __call__(self, obs, reset, state=None, reward=None, training=True):
+  def __call__(self, idx, offset, obs, reset, state=None, reward=None, training=True):
+    obs = {k:v[idx] for k,v in obs.items()}
+    if (len(obs['image'].shape) == 3):
+      obs['image'] = np.expand_dims(obs['image'], axis=0)
+    if (len(obs['obs'].shape) == 1):
+      obs['obs'] = np.expand_dims(obs['obs'], axis=0)
+    obs['reward'] = [obs['reward']]
+
+    env_name = self._config.args.envs_train_names[idx + offset]
+    self._task_behavior.actor.change_morphology(self._config.args.graphs[env_name])
+    self._expl_behavior.actor.change_morphology(self._config.args.graphs[env_name])
+    # obs_size = self._expl_behavior.actor.num_limbs * self._expl_behavior.actor.state_dim
+    # obs['obs'] = obs['obs'][:, :obs_size]
+
+
     step = self._step
     if self._should_reset(step):
       state = None
@@ -72,13 +88,14 @@ class Dreamer(nn.Module):
           self._config.pretrain if self._should_pretrain()
           else self._config.train_steps)
       for _ in range(steps):
-        self._train(next(self._dataset))
+        self._train(next(self._dataset), offset)
       if self._should_log(step):
         for name, values in self._metrics.items():
           self._logger.scalar(name, float(np.mean(values)))
           self._metrics[name] = []
-        openl = self._wm.video_pred(next(self._dataset))
-        self._logger.video('train_openl', to_np(openl))
+        video_pred = self._wm.video_pred(next(self._dataset))
+        for i in range(len(video_pred)):
+          self._logger.video(f'eval_openl_{self._config.args.envs_train_names[i+offset]}', to_np(video_pred[i]))
         self._logger.write(fps=True)
 
     policy_output, state = self._policy(obs, state, training)
@@ -96,19 +113,23 @@ class Dreamer(nn.Module):
     else:
       latent, action = state
     embed = self._wm.encoder(self._wm.preprocess(obs))
+    if len(embed.shape) == 1:
+      embed = embed.unsqueeze(0)
+
     latent, _ = self._wm.dynamics.obs_step(
         latent, action, embed, self._config.collect_dyn_sample)
     if self._config.eval_state_mean:
       latent['stoch'] = latent['mean']
     feat = self._wm.dynamics.get_feat(latent)
+
     if not training:
-      actor = self._task_behavior.actor(feat, self._wm.heads['image'])
+      actor = self._task_behavior.actor(feat, self._wm.heads['obs'])
       action = actor.mode()
     elif self._should_expl(self._step):
-      actor = self._expl_behavior.actor(feat, self._wm.heads['image'])
+      actor = self._expl_behavior.actor(feat, self._wm.heads['obs'])
       action = actor.sample()
     else:
-      actor = self._task_behavior.actor(feat, self._wm.heads['image'])
+      actor = self._task_behavior.actor(feat, self._wm.heads['obs'])
       action = actor.sample()
     logprob = actor.log_prob(action)
     latent = {k: v.detach()  for k, v in latent.items()}
@@ -131,28 +152,34 @@ class Dreamer(nn.Module):
       return torch.clip(torchd.normal.Normal(action, amount).sample(), -1, 1)
     raise NotImplementedError(self._config.action_noise)
 
-  def _train(self, data):
+  def _train(self, dataX, offset):
     metrics = {}
-    post, context, mets = self._wm._train(data)
-    metrics.update(mets)
-    start = post
-    if self._config.pred_discount:  # Last step could be terminal.
-      start = {k: v[:, :-1] for k, v in post.items()}
-      context = {k: v[:, :-1] for k, v in context.items()}
-    reward = lambda f, s, a: self._wm.heads['reward'](
-        self._wm.dynamics.get_feat(s)).mode()
+    num_train_env = dataX['obs'].shape[2]
+    for i in range(num_train_env):
+      data = {k: v[:,:,i] for k,v in dataX.items()}
 
-    metrics.update(self._task_behavior._train(start, reward, decoder = self._wm.heads['image'])[-1])
-    if self._config.expl_behavior != 'greedy':
-      if self._config.pred_discount:
-        data = {k: v[:, :-1] for k, v in data.items()}
-      mets = self._expl_behavior.train(start, context, data)[-1]
-      metrics.update({'expl_' + key: value for key, value in mets.items()})
-    for name, value in metrics.items():
-      if not name in self._metrics.keys():
-        self._metrics[name] = [value]
-      else:
-        self._metrics[name].append(value)
+      prestr = self._config.args.envs_train_names[i + offset]
+      post, context, mets = self._wm._train(data, prestr)
+      metrics.update(mets)
+      start = post
+      if self._config.pred_discount:  # Last step could be terminal.
+        start = {k: v[:, :-1] for k, v in post.items()}
+        context = {k: v[:, :-1] for k, v in context.items()}
+      reward = lambda f, s, a: self._wm.heads['reward'](
+          self._wm.dynamics.get_feat(s)).mode()
+
+      metrics.update(self._task_behavior._train(start, reward, 
+                        decoder = self._wm.heads['obs'], prestr=prestr)[-1])
+      if self._config.expl_behavior != 'greedy':
+        if self._config.pred_discount:
+          data = {k: v[:, :-1] for k, v in data.items()}
+        mets = self._expl_behavior.train(start, context, data, prestr=prestr)[-1]
+        metrics.update({f'expl_' + key: value for key, value in mets.items()})
+      for name, value in metrics.items():
+        if not name in self._metrics.keys():
+          self._metrics[name] = [value]
+        else:
+          self._metrics[name].append(value)
 
 
 def count_steps(folder):
@@ -186,7 +213,7 @@ def make_env(config, logger, mode, train_eps, eval_eps):
         config.action_repeat)
     env = wrappers.OneHotAction(env)
   elif suite == 'modular':
-    env = wrappers.ModularControl(task, mode, config.action_repeat, config.size)
+    env = wrappers.ModularControl(config, task, mode, config.action_repeat, config.size)
     env = wrappers.NormalizeActions(env)
   else:
     raise NotImplementedError(suite)
@@ -201,14 +228,17 @@ def make_env(config, logger, mode, train_eps, eval_eps):
 
 
 def process_episode(config, logger, mode, train_eps, eval_eps, episode):
+  np.set_printoptions(formatter={'float_kind': lambda x: "{0:0.3f}".format(x)})
   directory = dict(train=config.traindir, eval=config.evaldir)[mode]
   cache = dict(train=train_eps, eval=eval_eps)[mode]
   filename = tools.save_episodes(directory, [episode])[0]
   length = len(episode['reward']) - 1
-  score = float(episode['reward'].astype(np.float64).sum())
+  score = episode['reward'].astype(np.float64).sum(axis=0)
   video = episode['image']
+  offset = 0
   if mode == 'eval':
     cache.clear()
+    offset = config.args.cnt_train
   if mode == 'train' and config.dataset_size:
     total = 0
     for key, ep in reversed(sorted(cache.items(), key=lambda x: x[0])):
@@ -218,12 +248,15 @@ def process_episode(config, logger, mode, train_eps, eval_eps, episode):
         del cache[key]
     logger.scalar('dataset_size', total + length)
   cache[str(filename)] = episode
-  print(f'{mode.title()} episode has {length} steps and return {score:.1f}.')
-  logger.scalar(f'{mode}_return', score)
+  print(f'{mode.title()} episode has {length} steps and return {score}.')
+  for i in range(score.shape[0]):
+    logger.scalar(f'{mode}_{config.args.envs_train_names[i + offset]}_return', score[i])
   logger.scalar(f'{mode}_length', length)
   logger.scalar(f'{mode}_episodes', len(cache))
   if mode == 'eval' or config.expl_gifs:
-    logger.video(f'{mode}_policy', video[None])
+    for i in range(video.shape[1]):
+      videoX = video[:,i]
+      logger.video(f'{mode}_{config.args.envs_train_names[i + offset]}_policy', videoX[None])
   logger.write()
 
 
@@ -242,7 +275,7 @@ def main(config):
   config.traindir.mkdir(parents=True, exist_ok=True)
   config.evaldir.mkdir(parents=True, exist_ok=True)
   step = count_steps(config.traindir)
-  logger = tools.Logger(logdir, config.action_repeat * step)
+  logger = tools.Logger(logdir, config.action_repeat * step, config)
 
   print('Create envs.')
   if config.offline_traindir:
@@ -256,9 +289,9 @@ def main(config):
     directory = config.evaldir
   eval_eps = tools.load_episodes(directory, limit=1)
   make = lambda mode: make_env(config, logger, mode, train_eps, eval_eps)
-  train_envs = [make('train') for _ in range(config.envs)]
-  eval_envs = [make('eval') for _ in range(config.envs)]
-  acts = train_envs[0].action_space
+  train_envs = make('train')
+  eval_envs = make('eval')
+  acts = train_envs.action_space
   config.num_actions = acts.n if hasattr(acts, 'n') else acts.shape[0]
   if not config.offline_traindir:
     prefill = max(0, config.prefill - count_steps(config.traindir))
@@ -270,12 +303,12 @@ def main(config):
       random_actor = torchd.independent.Independent(
           torchd.uniform.Uniform(torch.Tensor(acts.low)[None],
                                  torch.Tensor(acts.high)[None]), 1)
-    def random_agent(o, d, s, r):
+    def random_agent(idx, offset, o, d, s, r):
       action = random_actor.sample()
       logprob = random_actor.log_prob(action)
       return {'action': action, 'logprob': logprob}, None
-    tools.simulate(random_agent, train_envs, prefill)
-    tools.simulate(random_agent, eval_envs, episodes=1)
+    tools.simulate(random_agent, train_envs, config, prefill)
+    tools.simulate(random_agent, eval_envs, config, episodes=1)
     logger.step = config.action_repeat * count_steps(config.traindir)
 
   print('Simulate agent.')
@@ -287,18 +320,20 @@ def main(config):
     agent.load_state_dict(torch.load(logdir / 'latest_model.pt'))
     agent._should_pretrain._once = False
 
+
   state = None
   while agent._step < config.steps:
     logger.write()
     print('Start evaluation.')
     video_pred = agent._wm.video_pred(next(eval_dataset))
-    logger.video('eval_openl', to_np(video_pred))
+    for i in range(len(video_pred)):
+      logger.video(f'eval_openl_{config.args.envs_train_names[i + config.args.cnt_train]}', to_np(video_pred[i]))
     eval_policy = functools.partial(agent, training=False)
-    tools.simulate(eval_policy, eval_envs, episodes=1)
+    tools.simulate(eval_policy, eval_envs, config, episodes=1)
     print('Start training.')
-    state = tools.simulate(agent, train_envs, config.eval_every, state=state)
+    state = tools.simulate(agent, train_envs, config, config.eval_every, state=state)
     torch.save(agent.state_dict(), logdir / 'latest_model.pt')
-  for env in train_envs + eval_envs:
+  for env in [train_envs, eval_envs]:
     try:
       env.close()
     except Exception:

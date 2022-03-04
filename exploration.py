@@ -57,7 +57,7 @@ class Plan2Explore(nn.Module):
     metrics = {}
     stoch = start['stoch']
     if self._config.dyn_discrete:
-      stoch = tf.reshape(
+      stoch = torch.reshape(
           stoch, stoch.shape[:-2] + (stoch.shape[-2] * stoch.shape[-1]))
     target = {
         'embed': context['embed'],
@@ -67,7 +67,7 @@ class Plan2Explore(nn.Module):
     }[self._config.disag_target]
     inputs = context['feat']
     if self._config.disag_action_cond:
-      inputs = tf.concat([inputs, data['action']], -1)
+      inputs = torch.concat([inputs, data['action']], -1)
     metrics.update(self._train_ensemble(inputs, target))
     metrics.update(self._behavior.train(start, self._intrinsic_reward)[-1])
     return None, metrics

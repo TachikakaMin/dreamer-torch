@@ -1,3 +1,4 @@
+from re import A
 import torch
 from torch import nn
 import numpy as np
@@ -5,6 +6,7 @@ from PIL import ImageColor, Image, ImageDraw, ImageFont
 
 import networks
 import tools
+import ModularActor
 to_np = lambda x: x.detach().cpu().numpy()
 
 
@@ -12,6 +14,7 @@ class WorldModel(nn.Module):
 
   def __init__(self, step, config):
     super(WorldModel, self).__init__()
+    self._config = config
     self._step = step
     self._use_amp = True if config.precision==16 else False
     self._config = config
@@ -25,11 +28,11 @@ class WorldModel(nn.Module):
       raise NotImplemented(f"{config.size} is not applicable now")
     
     self.encoder = networks.ObsDenseHead(
-        config.obs_max_len,  # pytorch version
+        config.args.obs_max_len,  # pytorch version
         embed_size, config.obs_encoder_layers, config.units, config.act, std="leaned")
 
 
-    self.dynamics = networks.RSSM(
+    self.dynamics = networks.RSSM(config,
         config.dyn_stoch, config.dyn_deter, config.dyn_hidden,
         config.dyn_input_layers, config.dyn_output_layers,
         config.dyn_rec_depth, config.dyn_shared, config.dyn_discrete,
@@ -48,9 +51,9 @@ class WorldModel(nn.Module):
         config.cnn_depth, config.act, shape, config.decoder_kernels,
         config.decoder_thin)
 
-    # self.heads['obs'] = networks.DenseHead(
-    #     feat_size,  # pytorch version
-    #     config.obs_max_len, config.obs_decode_layers, config.units, config.act, std='learned')
+    self.heads['obs'] = networks.DenseHead(
+        feat_size,  # pytorch version
+        config.args.obs_max_len, config.obs_decode_layers, config.units, config.act, std='learned')
 
     self.heads['reward'] = networks.DenseHead(
         feat_size,  # pytorch version
@@ -68,7 +71,7 @@ class WorldModel(nn.Module):
     self._scales = dict(
         reward=config.reward_scale, discount=config.discount_scale)
 
-  def _train(self, data):
+  def _train(self, data, prestr):
     data = self.preprocess(data)
     with tools.RequiresGrad(self):
       with torch.cuda.amp.autocast(self._use_amp):
@@ -92,14 +95,14 @@ class WorldModel(nn.Module):
         model_loss = sum(losses.values()) + kl_loss
       metrics = self._model_opt(model_loss, self.parameters())
 
-    metrics.update({f'{name}_loss': to_np(loss) for name, loss in losses.items()})
-    metrics['kl_balance'] = kl_balance
-    metrics['kl_free'] = kl_free
-    metrics['kl_scale'] = kl_scale
-    metrics['kl'] = to_np(torch.mean(kl_value))
+    metrics.update({f'{prestr}_{name}_loss': to_np(loss) for name, loss in losses.items()})
+    metrics[f'{prestr}_kl_balance'] = kl_balance
+    metrics[f'{prestr}_kl_free'] = kl_free
+    metrics[f'{prestr}_kl_scale'] = kl_scale
+    metrics[f'{prestr}_kl'] = to_np(torch.mean(kl_value))
     with torch.cuda.amp.autocast(self._use_amp):
-      metrics['prior_ent'] = to_np(torch.mean(self.dynamics.get_dist(prior).entropy()))
-      metrics['post_ent'] = to_np(torch.mean(self.dynamics.get_dist(post).entropy()))
+      metrics[f'{prestr}_prior_ent'] = to_np(torch.mean(self.dynamics.get_dist(prior).entropy()))
+      metrics[f'{prestr}_post_ent'] = to_np(torch.mean(self.dynamics.get_dist(post).entropy()))
       context = dict(
           embed=embed, feat=self.dynamics.get_feat(post),
           kl=kl_value, postent=self.dynamics.get_dist(post).entropy())
@@ -123,23 +126,26 @@ class WorldModel(nn.Module):
 
   def video_pred(self, data):
     data = self.preprocess(data)
-    truth = data['image'][:6] + 0.5
+    truth = data['image'][:6] + 0.5 # [6, 15, 3, 64, 64, 3]
+    # [64, 15, 3, 95]
     embed = self.encoder(data)
+    # [64, 15, 3, 512]
+    ret = []
+    for i in range(embed.shape[2]):
+      states, _ = self.dynamics.observe(embed[:6, :5, i], data['action'][:6, :5, i])
+      recon = self.heads['image'](
+          self.dynamics.get_feat(states)).mode()[:6]
+      reward_post = self.heads['reward'](
+          self.dynamics.get_feat(states)).mode()[:6]
 
-    states, _ = self.dynamics.observe(embed[:6, :5], data['action'][:6, :5])
-    recon = self.heads['image'](
-        self.dynamics.get_feat(states)).mode()[:6]
-    reward_post = self.heads['reward'](
-        self.dynamics.get_feat(states)).mode()[:6]
-
-    init = {k: v[:, -1] for k, v in states.items()}
-    prior = self.dynamics.imagine(data['action'][:6, 5:], init)
-    openl = self.heads['image'](self.dynamics.get_feat(prior)).mode()
-    reward_prior = self.heads['reward'](self.dynamics.get_feat(prior)).mode()
-    model = torch.cat([recon[:, :5] + 0.5, openl + 0.5], 1)
-    error = (model - truth + 1) / 2
-
-    return torch.cat([truth, model, error], 2)
+      init = {k: v[:, -1] for k, v in states.items()}
+      prior = self.dynamics.imagine(data['action'][:6, 5:, i], init)
+      openl = self.heads['image'](self.dynamics.get_feat(prior)).mode()
+      reward_prior = self.heads['reward'](self.dynamics.get_feat(prior)).mode()
+      model = torch.cat([recon[:, :5] + 0.5, openl + 0.5], 1)
+      error = (model - truth[:,:,i] + 1) / 2
+      ret.append(torch.cat([truth[:,:,i], model, error], 2))
+    return ret
 
 
 class ImagBehavior(nn.Module):
@@ -155,11 +161,11 @@ class ImagBehavior(nn.Module):
       feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
     else:
       feat_size = config.dyn_stoch + config.dyn_deter
-    self.actor = networks.ActionHead(
-        feat_size,  # pytorch version
-        config.num_actions, config.actor_layers, config.units, config.act,
-        config.actor_dist, config.actor_init_std, config.actor_min_std,
-        config.actor_dist, config.actor_temp, config.actor_outscale)
+    # self.actor = networks.ActionHead(
+    #     feat_size,  # pytorch version
+    #     config.num_actions, config.actor_layers, config.units, config.act,
+    #     config.actor_dist, config.actor_init_std, config.actor_min_std,
+    #     config.actor_dist, config.actor_temp, config.actor_outscale)
     
     # self.actor = networks.ConvActor(config, config.grayscale,
     #     config.cnn_actor_depth, config.act, 
@@ -167,11 +173,22 @@ class ImagBehavior(nn.Module):
     #     config.actor_init_std, config.actor_min_std)
     
     # self.actor = networks.ObsActor(
-    #     config.obs_max_len,
+    #     config.args.obs_max_len,
     #     config.num_actions, config.obs_actor_layers, config.units, config.act,
     #     config.actor_dist, config.actor_init_std, config.actor_min_std,
     #     config.actor_dist, config.actor_temp, config.actor_outscale
     # )
+
+    # self.actor = ModularActor.ActorVanilla(
+    #   config.args.obs_max_len, config.num_actions, 1, 
+    #   config.actor_init_std, config.actor_min_std
+    # )
+
+    self.actor = ModularActor.ActorGraphPolicy(
+      config.args.limb_obs_size, 1, config.args.max_children
+    )
+    env_name = config.args.envs_train_names[0]
+    self.actor.change_morphology(config.args.graphs[env_name])
 
     self.value = networks.DenseHead(
         feat_size,  # pytorch version
@@ -191,7 +208,9 @@ class ImagBehavior(nn.Module):
         **kw)
 
   def _train(
-      self, start, objective=None, action=None, reward=None, imagine=None, tape=None, repeats=None, decoder=None):
+      self, start, objective=None, action=None, 
+      reward=None, imagine=None, tape=None, 
+      repeats=None, decoder=None, prestr=""):
     objective = objective or self._reward
     self._update_slow_target()
     metrics = {}
@@ -227,9 +246,9 @@ class ImagBehavior(nn.Module):
           value_loss += self._config.value_decay * value.mode()
         value_loss = torch.mean(weights[:-1] * value_loss[:,:,None])
 
-    metrics['reward_mean'] = to_np(torch.mean(reward))
-    metrics['reward_std'] = to_np(torch.std(reward))
-    metrics['actor_ent'] = to_np(torch.mean(actor_ent))
+    metrics[f'{prestr}_reward_mean'] = to_np(torch.mean(reward))
+    metrics[f'{prestr}_reward_std'] = to_np(torch.std(reward))
+    metrics[f'{prestr}_actor_ent'] = to_np(torch.mean(actor_ent))
     with tools.RequiresGrad(self):
       metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
       metrics.update(self._value_opt(value_loss, self.value.parameters()))

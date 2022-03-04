@@ -6,7 +6,7 @@ import pickle
 import re
 import time
 import uuid
-
+from copy import deepcopy as dp
 import numpy as np
 
 import torch
@@ -47,8 +47,9 @@ class TimeRecording:
 
 class Logger:
 
-  def __init__(self, logdir, step):
+  def __init__(self, logdir, step, config):
     self._logdir = logdir
+    self._config = config
     self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
     self._last_step = None
     self._last_time = None
@@ -112,47 +113,51 @@ class Logger:
     self._writer.add_video(name, value, step, 16)
 
 
-def simulate(agent, envs, steps=0, episodes=0, state=None):
+def simulate(agent, env, config, steps=0, episodes=0, state=None):
   # Initialize or unpack simulation state.
+  num_envs_train = config.args.cnt_train
+  offset = 0
+  if episodes == 1:
+    num_envs_train = config.args.num_envs_train - config.args.cnt_train
+    offset = config.args.cnt_train
+
   if state is None:
     step, episode = 0, 0
-    done = np.ones(len(envs), np.bool)
-    length = np.zeros(len(envs), np.int32)
-    obs = [None] * len(envs)
-    agent_state = None
-    reward = [0]*len(envs)
+    done = np.ones(num_envs_train, np.bool)
+    length = np.zeros(num_envs_train, np.int32)
+    obs = [None] * num_envs_train
+    agent_states = [None] * num_envs_train
+    reward = [0]* num_envs_train
   else:
-    step, episode, done, length, obs, agent_state, reward = state
+    step, episode, done, length, obs, agent_states, reward = state
+  
   while (steps and step < steps) or (episodes and episode < episodes):
     # Reset envs if necessary.
     if done.any():
-      indices = [index for index, d in enumerate(done) if d]
-      results = [envs[i].reset() for i in indices]
-      for index, result in zip(indices, results):
-        obs[index] = result
-      reward = [reward[i]*(1-done[i]) for i in range(len(envs))]
+      obs = env.reset()
+      reward = reward*(1-done)
+    actions = [None] * num_envs_train
     # Step agents.
-    obs = {k: np.stack([o[k] for o in obs]) for k in obs[0]}
-    action, agent_state = agent(obs, done, agent_state, reward)
-    if isinstance(action, dict):
-      action = [
-          {k: np.array(action[k][i].detach().cpu()) for k in action}
-          for i in range(len(envs))]
-    else:
-      action = np.array(action)
-    assert len(action) == len(envs)
+    
+    for i in range(num_envs_train):
+        action, agent_state = agent(i, offset, obs, done, 
+                                    agent_states[i], reward)
+        # action = {k:v.cpu() for k,v in action.items()}
+        action['action'] = nn.ConstantPad1d((0, config.args.max_num_limbs - action['action'].shape[-1]), 0)(action['action'])
+        actions[i] = action
+        agent_states[i] = agent_state
+
+    assert len(actions) == num_envs_train
+    actions = {'action': np.stack([a['action'].detach().cpu() for a in actions]),
+              'logprob': np.stack([a['logprob'].detach().cpu() for a in actions]) }
     # Step envs.
-    results = [e.step(a) for e, a in zip(envs, action)]
-    obs, reward, done = zip(*[p[:3] for p in results])
-    obs = list(obs)
-    reward = list(reward)
-    done = np.stack(done)
+    obs, reward, done, info = env.step(actions)
     episode += int(done.sum())
     length += 1
     step += (done * length).sum()
     length *= (1 - done)
 
-  return (step - steps, episode - episodes, done, length, obs, agent_state, reward)
+  return (step - steps, episode - episodes, done, length, obs, agent_states, reward)
 
 
 def save_episodes(directory, episodes):

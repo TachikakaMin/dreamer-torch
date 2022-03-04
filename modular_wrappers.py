@@ -33,7 +33,7 @@ class ModularEnvWrapper(gym.Wrapper):
 
     def step(self, action):
         # clip the 0-padding before processing
-        action = action[:self.num_limbs]
+        action = action[0, :self.num_limbs]
         # match the order of the environment actions
         env_action = [None for i in range(len(self.motors))]
         for i in range(len(action)):

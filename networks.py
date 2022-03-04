@@ -11,12 +11,13 @@ import tools
 class RSSM(nn.Module):
 
   def __init__(
-      self, stoch=30, deter=200, hidden=200, layers_input=1, layers_output=1,
+      self, config, stoch=30, deter=200, hidden=200, layers_input=1, layers_output=1,
       rec_depth=1, shared=False, discrete=False, act=nn.ELU,
       mean_act='none', std_act='softplus', temp_post=True, min_std=0.1,
       cell='gru',
       num_actions=None, embed = None, device=None):
     super(RSSM, self).__init__()
+    self._config = config
     self._stoch = stoch
     self._deter = deter
     self._hidden = hidden
@@ -157,6 +158,10 @@ class RSSM(nn.Module):
     return post, prior
 
   def img_step(self, prev_state, prev_action, embed=None, sample=True):
+    if len(prev_action.shape)==3:
+      prev_action = prev_action[:,0,:]
+    prev_action = nn.ConstantPad1d((0, self._config.args.max_num_limbs - prev_action.shape[-1]), 0)(prev_action)
+    
     prev_stoch = prev_state['stoch']
     if self._discrete:
       shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
@@ -167,6 +172,7 @@ class RSSM(nn.Module):
         embed = torch.zeros(shape)
       x = torch.cat([prev_stoch, prev_action, embed], -1)
     else:
+      
       x = torch.cat([prev_stoch, prev_action], -1)
     x = self._inp_layers(x)
     for _ in range(self._rec_depth): # rec depth is not correctly implemented

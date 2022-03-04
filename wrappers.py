@@ -167,13 +167,10 @@ class DeepMindControl:
 
 
 class ModularControl:
-  def __init__(self, morphologies, mode,  action_repeat=1, size=(64, 64), camera=None):
-    domain, _ = morphologies.split('_', 1)
+  def __init__(self, config, morphologies, mode,  action_repeat=1, size=(64, 64), camera=None):
     self._action_repeat = action_repeat
     self._size = size
-    if camera is None:
-      camera = dict(quadruped=2).get(domain, 0)
-    self._camera = camera
+    self._camera = None
 
     envs_train_names = []
     args = argparse.Namespace()
@@ -183,6 +180,7 @@ class ModularControl:
     # existing envs
     for morphology in args.morphologies:
       envs_train_names += [name[:-4] for name in os.listdir(XML_DIR) if '.xml' in name and morphology in name]
+
     for name in envs_train_names:
       args.graphs[name] = utils.getGraphStructure(os.path.join(XML_DIR, '{}.xml'.format(name)))
     envs_train_names.sort()
@@ -191,15 +189,26 @@ class ModularControl:
     print("#" * 50 + '\ntraining envs: {}\n'.format(envs_train_names) + "#" * 50)
 
     # Set up training env and policy ================================================
+    
+      
     args.limb_obs_size, args.max_action, envs_train = utils.registerEnvs(args, envs_train_names, mode)
     args.max_num_limbs = max([len(args.graphs[env_name]) for env_name in envs_train_names])
     # create vectorized training env
     args.obs_max_len = args.max_num_limbs * args.limb_obs_size
-    print("obs_max_len: ", args.obs_max_len)
+    args.max_children = utils.findMaxChildren(envs_train_names, args.graphs)
+    
+    args.cnt_train = int(args.num_envs_train * 0.8)
+    self.mode = mode
+    if mode == 'train':
+      envs_train = envs_train[:args.cnt_train]
+      print("train env: ", args.envs_train_names[:args.cnt_train])
+    else :
+      envs_train = envs_train[args.cnt_train:]
+      print("eval env: ", args.envs_train_names[args.cnt_train:])
     self._env = SubprocVecEnv(envs_train)  # vectorized env
     # determine the maximum number of children in all the training envs
-    args.max_children = utils.findMaxChildren(envs_train_names, args.graphs)
     self.args = args
+    config.args = args
 
   @property
   def observation_space(self):
@@ -217,23 +226,25 @@ class ModularControl:
     return gym.spaces.Box(spec.low[0], spec.high[0], (self.args.max_num_limbs,),dtype=np.float32)
 
   def step(self, action):
-    action = [action]
     assert np.isfinite(action).all(), action
-    reward = 0
-    for _ in range(self._action_repeat):
-      obs, r, done, info = self._env.step(action)
-      obs, r, done, info = obs[0], r[0], done[0], info[0]
-      reward += r
-      if done: break
+    if self.mode == 'train':
+      num_envs_train = self.args.cnt_train
+    else :
+      num_envs_train = self.args.num_envs_train - self.args.cnt_train
+    reward = np.zeros(num_envs_train, dtype=float)
+
+    obs, r, done, info = self._env.step(action)
+    for i in range(num_envs_train):
+      reward[i] += r[i]
     obs = {"obs" : obs}
-    obs['image'] = self.render()[0]
-    info = dict(info)
+    obs['image'] = self.render()
+    info = {}
     return obs, reward, done, info
 
   def reset(self):
     obs_list = self._env.reset()
-    obs = {'obs': obs_list[0]}
-    obs['image'] = self.render()[0]
+    obs = {'obs': obs_list}
+    obs['image'] = self.render()
     return obs
 
   def render(self, *args, **kwargs):
@@ -241,6 +252,7 @@ class ModularControl:
       raise ValueError("Only render mode 'rgb_array' is supported.")
     env_img_list = self._env.get_images()
     new_img_list = [cv2.resize(img, self._size) for img in env_img_list]
+    new_img_list = np.array(new_img_list)
     return new_img_list
 
 
@@ -317,21 +329,23 @@ class CollectDataset:
 
   def step(self, action):
     obs, reward, done, info = self._env.step(action)
-    obs = {k: self._convert(v) for k, v in obs.items()}
+    obs = {k: self._convert(v, k) for k, v in obs.items()}
     transition = obs.copy()
     if isinstance(action, dict):
       transition.update(action)
     else:
       transition['action'] = action
     transition['reward'] = reward
-    transition['discount'] = info.get('discount', np.array(1 - float(done)))
+    transition['discount'] = info.get('discount', np.array(1 - done, dtype=float))
     self._episode.append(transition)
-    if done:
+    if done.sum():
       for key, value in self._episode[1].items():
         if key not in self._episode[0]:
           self._episode[0][key] = 0 * value
+      
       episode = {k: [t[k] for t in self._episode] for k in self._episode[0]}
-      episode = {k: self._convert(v) for k, v in episode.items()}
+
+      episode = {k: self._convert(v, k) for k, v in episode.items()}
       info['episode'] = episode
       for callback in self._callbacks:
         callback(episode)
@@ -343,12 +357,17 @@ class CollectDataset:
     # Missing keys will be filled with a zeroed out version of the first
     # transition, because we do not know what action information the agent will
     # pass yet.
-    transition['reward'] = 0.0
-    transition['discount'] = 1.0
+    if self.mode == 'train':
+      num_envs_train = self.args.cnt_train
+    else :
+      num_envs_train = self.args.num_envs_train - self.args.cnt_train
+    
+    transition['reward'] = np.zeros(num_envs_train)
+    transition['discount'] = np.ones(num_envs_train)
     self._episode = [transition]
     return obs
 
-  def _convert(self, value):
+  def _convert(self, value, key):
     value = np.array(value)
     if np.issubdtype(value.dtype, np.floating):
       dtype = {16: np.float16, 32: np.float32, 64: np.float64}[self._precision]
@@ -376,9 +395,9 @@ class TimeLimit:
     obs, reward, done, info = self._env.step(action)
     self._step += 1
     if self._step >= self._duration:
-      done = True
+      done = np.ones(done.shape).astype(np.bool)
       if 'discount' not in info:
-        info['discount'] = np.array(1.0).astype(np.float32)
+        info['discount'] = np.ones(done.shape).astype(np.float32)
       self._step = None
     return obs, reward, done, info
 
@@ -471,7 +490,12 @@ class RewardObs:
 
   def reset(self):
     obs = self._env.reset()
-    obs['reward'] = 0.0
+    if self.mode == 'train':
+      num_envs_train = self.args.cnt_train
+    else :
+      num_envs_train = self.args.num_envs_train - self.args.cnt_train
+    
+    obs['reward'] = np.zeros(num_envs_train)
     return obs
 
 

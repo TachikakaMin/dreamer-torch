@@ -6,6 +6,9 @@ import torch.nn.functional as F
 import xmltodict
 import modular_wrappers as wrappers
 import gym
+import torch
+import tools
+from torch import distributions as torchd
 from gym.envs.registration import register
 from shutil import copyfile
 from config import *
@@ -31,6 +34,7 @@ def findMaxChildren(env_names, graphs):
     for name in env_names:
         most_frequent = max(graphs[name], key=graphs[name].count)
         max_children = max(max_children, graphs[name].count(most_frequent))
+        
     return max_children
 
 
@@ -39,6 +43,7 @@ def registerEnvs(args, env_names, mode):
     # get all paths to xmls (handle the case where the given path is a directory containing multiple xml files)
     paths_to_register = []
     # existing envs
+
     for name in env_names:
         paths_to_register.append(os.path.join(XML_DIR, "{}.xml".format(name)))
 
@@ -56,6 +61,7 @@ def registerEnvs(args, env_names, mode):
             register(id=("%s-v0" % env_name),
                     entry_point="environments.%s:ModularEnv" % env_file,
                     kwargs=params)
+
         env = wrappers.IdentityWrapper(gym.make("environments:%s-v0" % env_name))
         # the following is the same for each env
         limb_obs_size = env.limb_obs_size
@@ -180,7 +186,6 @@ class ReplayBuffer(object):
         return (np.array(x), np.array(y), np.array(u),
                     np.array(r), np.array(d))
 
-
 class MLPBase(nn.Module):
     def __init__(self, num_inputs, num_outputs):
         super(MLPBase, self).__init__()
@@ -194,6 +199,28 @@ class MLPBase(nn.Module):
         x = self.l3(x)
         return x
 
+class MLPBaseDist(nn.Module):
+    def __init__(self, num_inputs, num_outputs, min_std = 0.1, init_std = 1):
+        super(MLPBaseDist, self).__init__()
+        self.l1 = nn.Linear(num_inputs, 400)
+        self.l2 = nn.Linear(400, 300)
+        self._dist_layer = nn.Linear(300, 2 * num_outputs)
+        self._size = num_outputs
+        self._min_std = min_std
+        self._init_std = init_std
+
+
+    def forward(self, inputs):
+        x = F.elu(self.l1(inputs))
+        x = F.elu(self.l2(x))
+        x = self._dist_layer(x)
+        mean, std = torch.split(x, [self._size]*2, -1)
+        mean = torch.tanh(mean)
+        std = 2 * torch.sigmoid(std / 2) + self._min_std
+        dist = tools.SafeTruncatedNormal(mean, std, -1, 1)
+        dist = tools.ContDist(torchd.independent.Independent(dist, 1))
+        return dist
+
 
 def getGraphStructure(xml_file):
     """Traverse the given xml file as a tree by pre-order and return the graph structure as a parents list"""
@@ -206,6 +233,7 @@ def getGraphStructure(xml_file):
             b['body'] = [b['body']]
         for branch in b['body']:
             preorder(branch, self_idx)
+
     with open(xml_file) as fd:
         xml = xmltodict.parse(fd.read())
     parents = []

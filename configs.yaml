@@ -285,18 +285,20 @@ debug:
   batch_length: 20
 
 modular:
+  task: 'modular_walker'
   cnn_depth: 16
   cnn_actor_depth: 4
   fc_layer_depth: 3
   obs_actor_layers: 3
   obs_encoder_layers: 4
-  obs_decode_layers: 4
-  batch_length: 30
+  obs_decode_layers: 5
+  batch_length: 15
   imag_horizon: 10
   model_lr: 3e-4
   value_lr: 8e-5
   actor_lr: 8e-5
-  obs_max_len: 38
-  time_limit: 100
+  time_limit: 200
   expl_amount: 0.1
   eval_noise: 0.1
+  prefill: 30000
+  # eval_every: 100
