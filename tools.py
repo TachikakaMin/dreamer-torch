@@ -15,18 +15,38 @@ from torch.nn import functional as F
 from torch import distributions as torchd
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
+from typing import Iterable
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def get_parameters(modules: Iterable[nn.Module]):
+    """
+    Given a list of torch modules, returns a list of their parameters.
+    :param modules: iterable of modules
+    :returns: a list of parameters
+    """
+    model_parameters = []
+    for module in modules:
+        model_parameters += list(module.parameters())
+    return model_parameters
 class RequiresGrad:
 
   def __init__(self, model):
     self._model = model
 
   def __enter__(self):
-    self._model.requires_grad_(requires_grad=True)
+    if isinstance(self._model, list):
+      for param in self._model:
+        param.requires_grad = True
+    else:
+      self._model.requires_grad_(requires_grad=True)
 
   def __exit__(self, *args):
-    self._model.requires_grad_(requires_grad=False)
+    if isinstance(self._model, list):
+      for param in self._model:
+        param.requires_grad = False
+    else:
+      self._model.requires_grad_(requires_grad=False)
 
 
 class TimeRecording:
@@ -138,7 +158,6 @@ def simulate(agent, env, config, steps=0, episodes=0, state=None):
       reward = reward*(1-done)
     actions = [None] * num_envs_train
     # Step agents.
-    
     for i in range(num_envs_train):
         action, agent_state = agent(i, offset, obs, done, 
                                     agent_states[i], reward)
@@ -156,7 +175,6 @@ def simulate(agent, env, config, steps=0, episodes=0, state=None):
     length += 1
     step += (done * length).sum()
     length *= (1 - done)
-
   return (step - steps, episode - episodes, done, length, obs, agent_states, reward)
 
 
@@ -167,7 +185,7 @@ def save_episodes(directory, episodes):
   filenames = []
   for episode in episodes:
     identifier = str(uuid.uuid4().hex)
-    length = len(episode['reward'])
+    length = episode['reward'].shape[0] * episode['reward'].shape[1]
     filename = directory / f'{timestamp}-{identifier}-{length}.npz'
     with io.BytesIO() as f1:
       np.savez_compressed(f1, **episode)

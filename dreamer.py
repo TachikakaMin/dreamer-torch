@@ -24,7 +24,7 @@ import torch
 from torch import nn, unsqueeze
 from torch import distributions as torchd
 to_np = lambda x: x.detach().cpu().numpy()
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Dreamer(nn.Module):
 
@@ -159,7 +159,8 @@ class Dreamer(nn.Module):
       data = {k: v[:,:,i] for k,v in dataX.items()}
 
       prestr = self._config.args.envs_train_names[i + offset]
-      post, context, mets = self._wm._train(data, prestr)
+      prestr_wm = prestr + '_wm'
+      post, context, mets = self._wm._train(data, prestr_wm)
       metrics.update(mets)
       start = post
       if self._config.pred_discount:  # Last step could be terminal.
@@ -168,12 +169,15 @@ class Dreamer(nn.Module):
       reward = lambda f, s, a: self._wm.heads['reward'](
           self._wm.dynamics.get_feat(s)).mode()
 
+      prestr_task = prestr + '_task'
       metrics.update(self._task_behavior._train(start, reward, 
-                        decoder = self._wm.heads['obs'], prestr=prestr)[-1])
+                        decoder = self._wm.heads['obs'], prestr=prestr_task)[-1])
       if self._config.expl_behavior != 'greedy':
         if self._config.pred_discount:
           data = {k: v[:, :-1] for k, v in data.items()}
-        mets = self._expl_behavior.train(start, context, data, prestr=prestr)[-1]
+        prestr_expl = prestr + '_expl'
+        mets = self._expl_behavior.train(start, context, data,
+                        decoder = self._wm.heads['obs'], prestr=prestr_expl)[-1]
         metrics.update({f'expl_' + key: value for key, value in mets.items()})
       for name, value in metrics.items():
         if not name in self._metrics.keys():
@@ -328,10 +332,16 @@ def main(config):
     video_pred = agent._wm.video_pred(next(eval_dataset))
     for i in range(len(video_pred)):
       logger.video(f'eval_openl_{config.args.envs_train_names[i + config.args.cnt_train]}', to_np(video_pred[i]))
+      # logger.video(f'eval_openl_{config.args.envs_train_names[i]}', to_np(video_pred[i]))
+    
     eval_policy = functools.partial(agent, training=False)
     tools.simulate(eval_policy, eval_envs, config, episodes=1)
     print('Start training.')
     state = tools.simulate(agent, train_envs, config, config.eval_every, state=state)
+    
+    env_name = agent._config.args.envs_train_names[0]
+    agent._task_behavior.actor.change_morphology(agent._config.args.graphs[env_name])
+    agent._expl_behavior.actor.change_morphology(agent._config.args.graphs[env_name])
     torch.save(agent.state_dict(), logdir / 'latest_model.pt')
   for env in [train_envs, eval_envs]:
     try:

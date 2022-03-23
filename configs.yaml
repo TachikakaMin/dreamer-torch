@@ -302,3 +302,12 @@ modular:
   eval_noise: 0.1
   prefill: 30000
   # eval_every: 100
+
+plan2explore:
+  task: 'modular_cheetah'
+  expl_behavior: 'plan2explore'
+  disag_target: 'feat'
+  prefill: 30000
+  # log_every: 1e3
+  eval_every: 1e2
+  expl_until: 500000

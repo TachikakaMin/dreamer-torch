@@ -6,6 +6,7 @@ import os
 import utils
 import argparse
 import cv2
+import torch
 from config import *
 class DeepMindLabyrinth(object):
 
@@ -180,6 +181,7 @@ class ModularControl:
     # existing envs
     for morphology in args.morphologies:
       envs_train_names += [name[:-4] for name in os.listdir(XML_DIR) if '.xml' in name and morphology in name]
+    # envs_train_names = ["cheetah_4_front"]
 
     for name in envs_train_names:
       args.graphs[name] = utils.getGraphStructure(os.path.join(XML_DIR, '{}.xml'.format(name)))
@@ -196,18 +198,22 @@ class ModularControl:
     # create vectorized training env
     args.obs_max_len = args.max_num_limbs * args.limb_obs_size
     args.max_children = utils.findMaxChildren(envs_train_names, args.graphs)
-    
     args.cnt_train = int(args.num_envs_train * 0.8)
+    # args.cnt_train = args.num_envs_train
     self.mode = mode
     if mode == 'train':
       envs_train = envs_train[:args.cnt_train]
       print("train env: ", args.envs_train_names[:args.cnt_train])
     else :
+      # envs_train = envs_train[:args.cnt_train]
+      # print("eval env: ", args.envs_train_names[:args.cnt_train])
       envs_train = envs_train[args.cnt_train:]
       print("eval env: ", args.envs_train_names[args.cnt_train:])
+      
     self._env = SubprocVecEnv(envs_train)  # vectorized env
     # determine the maximum number of children in all the training envs
     self.args = args
+    self.config = config
     config.args = args
 
   @property
@@ -227,10 +233,10 @@ class ModularControl:
 
   def step(self, action):
     assert np.isfinite(action).all(), action
-    if self.mode == 'train':
-      num_envs_train = self.args.cnt_train
-    else :
+    num_envs_train = self.args.cnt_train
+    if self.mode != 'train':
       num_envs_train = self.args.num_envs_train - self.args.cnt_train
+    
     reward = np.zeros(num_envs_train, dtype=float)
 
     obs, r, done, info = self._env.step(action)
@@ -338,7 +344,7 @@ class CollectDataset:
     transition['reward'] = reward
     transition['discount'] = info.get('discount', np.array(1 - done, dtype=float))
     self._episode.append(transition)
-    if done.sum():
+    if done.any():
       for key, value in self._episode[1].items():
         if key not in self._episode[0]:
           self._episode[0][key] = 0 * value
@@ -357,9 +363,8 @@ class CollectDataset:
     # Missing keys will be filled with a zeroed out version of the first
     # transition, because we do not know what action information the agent will
     # pass yet.
-    if self.mode == 'train':
-      num_envs_train = self.args.cnt_train
-    else :
+    num_envs_train = self.args.cnt_train
+    if self.mode != 'train':
       num_envs_train = self.args.num_envs_train - self.args.cnt_train
     
     transition['reward'] = np.zeros(num_envs_train)
@@ -490,9 +495,8 @@ class RewardObs:
 
   def reset(self):
     obs = self._env.reset()
-    if self.mode == 'train':
-      num_envs_train = self.args.cnt_train
-    else :
+    num_envs_train = self.args.cnt_train
+    if self.mode != 'train':
       num_envs_train = self.args.num_envs_train - self.args.cnt_train
     
     obs['reward'] = np.zeros(num_envs_train)

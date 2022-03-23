@@ -150,7 +150,7 @@ class WorldModel(nn.Module):
 
 class ImagBehavior(nn.Module):
 
-  def __init__(self, config, world_model, stop_grad_actor=True, reward=None):
+  def __init__(self, config, world_model, stop_grad_actor=True, reward=None, prestr=""):
     super(ImagBehavior, self).__init__()
     self._use_amp = True if config.precision==16 else False
     self._config = config
@@ -201,10 +201,10 @@ class ImagBehavior(nn.Module):
       self._updates = 0
     kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
     self._actor_opt = tools.Optimizer(
-        'actor', self.actor.parameters(), config.actor_lr, config.opt_eps, config.actor_grad_clip,
+        'actor' + prestr, self.actor.parameters(), config.actor_lr, config.opt_eps, config.actor_grad_clip,
         **kw)
     self._value_opt = tools.Optimizer(
-        'value', self.value.parameters(), config.value_lr, config.opt_eps, config.value_grad_clip,
+        'value' + prestr, self.value.parameters(), config.value_lr, config.opt_eps, config.value_grad_clip,
         **kw)
 
   def _train(
